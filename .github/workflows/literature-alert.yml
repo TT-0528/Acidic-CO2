@@ -2,7 +2,7 @@ name: Acidic CO2 literature alerts
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 09 * * *"
       timezone: "Asia/Tokyo"
   workflow_dispatch:
 
