@@ -1,3 +1,9 @@
 {
-  "seen": {}
+  "seen": {
+    "10.20517/energymater.2026.129": {
+      "first_seen": "2026-08-04T02:04:51.493367+00:00",
+      "notified": true,
+      "title": "Mitigating hydrogen evolution via ionomer structure for efficient CO&lt;sub&gt;2&lt;/sub&gt; reduction in acidic membrane electrode assembly electrolyzers"
+    }
+  }
 }
