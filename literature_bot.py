@@ -2,14 +2,13 @@
 """Monitor OpenAlex for newly indexed acidic CO2 electroreduction literature.
 
 The script is designed for GitHub Actions. It searches recent works, applies a
-second local relevance filter, deduplicates results, and pushes unseen papers to
-Telegram.
+second local relevance filter, deduplicates results, and creates one GitHub Issue
+for an unseen paper on each scheduled run.
 """
 
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import logging
 import os
@@ -25,7 +24,7 @@ from typing import Any, Iterable
 import requests
 
 OPENALEX_URL = "https://api.openalex.org/works"
-TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
+GITHUB_ISSUES_URL = "https://api.github.com/repos/{repository}/issues"
 STATE_PATH = Path(os.getenv("STATE_PATH", "state/seen.json"))
 
 # Two complementary searches: one for explicitly acidic media and one for
@@ -329,52 +328,49 @@ def shorten(text: str, limit: int) -> str:
     return clean[: limit - 1].rstrip() + "…"
 
 
-def format_telegram_message(paper: Paper) -> str:
-    title = html.escape(paper.title)
-    authors = html.escape(shorten(paper.authors, 320))
-    venue = html.escape(paper.venue)
-    matched = html.escape(", ".join(paper.matched_terms))
-    abstract = html.escape(shorten(paper.abstract, 600))
-    url = html.escape(paper.url, quote=True)
-    doi_line = f"\n<b>DOI:</b> <code>{html.escape(paper.doi)}</code>" if paper.doi else ""
-    abstract_line = f"\n\n<b>Abstract:</b> {abstract}" if abstract else ""
-    link_line = f'\n\n<a href="{url}">Open paper</a>' if url else ""
+def format_github_issue(paper: Paper) -> tuple[str, str]:
+    """Build a concise GitHub Issue title and Markdown body."""
+    title = shorten(f"[Acidic CO₂RR] {paper.title}", 240)
+    matched = ", ".join(paper.matched_terms) or "—"
+    abstract = shorten(paper.abstract, 1200) or "Abstract unavailable in OpenAlex."
+    doi_line = f"- **DOI:** `{paper.doi}`\n" if paper.doi else ""
+    link_line = f"- **Paper:** {paper.url}\n" if paper.url else ""
 
-    return (
-        f"🧪 <b>Acidic CO₂RR literature</b>\n\n"
-        f"<b>{title}</b>\n"
-        f"<b>Date:</b> {html.escape(paper.publication_date)}\n"
-        f"<b>Type:</b> {html.escape(paper.work_type)}\n"
-        f"<b>Journal/source:</b> {venue}\n"
-        f"<b>Authors:</b> {authors}"
-        f"{doi_line}\n"
-        f"<b>Matched:</b> {matched}"
-        f"{abstract_line}"
-        f"{link_line}"
+    body = (
+        f"## {paper.title}\n\n"
+        f"- **Publication date:** {paper.publication_date}\n"
+        f"- **Type:** {paper.work_type}\n"
+        f"- **Journal/source:** {paper.venue}\n"
+        f"- **Authors:** {paper.authors}\n"
+        f"{doi_line}"
+        f"- **Matched terms:** {matched}\n"
+        f"{link_line}\n"
+        f"### Abstract\n\n{abstract}\n\n"
+        "---\n"
+        "Automatically selected from OpenAlex by the acidic CO₂ electroreduction filter."
     )
+    return title, body
 
 
-def send_telegram(token: str, chat_id: str, text: str) -> None:
+def create_github_issue(token: str, repository: str, paper: Paper) -> None:
+    title, body = format_github_issue(paper)
     response = requests.post(
-        TELEGRAM_URL.format(token=token),
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
+        GITHUB_ISSUES_URL.format(repository=repository),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
         },
+        json={"title": title, "body": body},
         timeout=30,
     )
     response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error: {payload}")
 
 
-def notify_papers(token: str, chat_id: str, papers: list[Paper]) -> list[str]:
+def notify_papers(token: str, repository: str, papers: list[Paper]) -> list[str]:
     delivered: list[str] = []
     for paper in papers:
-        send_telegram(token, chat_id, format_telegram_message(paper))
+        create_github_issue(token, repository, paper)
         delivered.append(paper.key)
         time.sleep(0.25)
     return delivered
@@ -385,13 +381,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print matching unseen papers without sending Telegram messages or changing state.",
+        help="Print matching unseen papers without creating GitHub Issues or changing state.",
     )
     parser.add_argument(
         "--lookback-days",
         type=int,
-        default=int(os.getenv("LOOKBACK_DAYS", "14")),
-        help="How far back to search on every run (default: 14).",
+        default=int(os.getenv("LOOKBACK_DAYS", "365")),
+        help="How far back to search on every run (default: 365).",
     )
     parser.add_argument(
         "--per-query",
@@ -411,10 +407,10 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("OPENALEX_API_KEY is required.")
         return 2
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not args.dry_run and (not token or not chat_id):
-        logging.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required.")
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    repository = os.getenv("GITHUB_REPOSITORY", "").strip()
+    if not args.dry_run and (not token or not repository):
+        logging.error("GITHUB_TOKEN and GITHUB_REPOSITORY are required.")
         return 2
 
     state = load_state()
@@ -443,33 +439,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         for paper in relevant[:max_alerts]:
             print("=" * 80)
-            print(format_telegram_message(paper))
+            issue_title, issue_body = format_github_issue(paper)
+            print(issue_title)
+            print(issue_body)
         return 0
 
     now = datetime.now(timezone.utc).isoformat()
-    if first_run:
-        # Bootstrap behavior: mark the entire current result set as known, but only
-        # send a manageable selection of the latest papers.
-        papers_to_send = relevant[:first_run_limit]
-        delivered = notify_papers(token, chat_id, papers_to_send) if papers_to_send else []
-        delivered_set = set(delivered)
-        for paper in relevant:
+    send_limit = first_run_limit if first_run else max_alerts
+    papers_to_send = relevant[:send_limit]
+    delivered = notify_papers(token, repository, papers_to_send) if papers_to_send else []
+    delivered_set = set(delivered)
+    for paper in papers_to_send:
+        if paper.key in delivered_set:
             seen[paper.key] = {
                 "first_seen": now,
                 "title": paper.title,
-                "notified": paper.key in delivered_set,
+                "notified": True,
             }
-    else:
-        papers_to_send = relevant[:max_alerts]
-        delivered = notify_papers(token, chat_id, papers_to_send)
-        delivered_set = set(delivered)
-        for paper in papers_to_send:
-            if paper.key in delivered_set:
-                seen[paper.key] = {
-                    "first_seen": now,
-                    "title": paper.title,
-                    "notified": True,
-                }
 
     trim_state(state)
     save_state(state)
